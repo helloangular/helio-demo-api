@@ -1,0 +1,196 @@
+name: "Helio delivery: demo-api"
+on:
+  push:
+    branches:
+      - main
+permissions:
+  contents: read
+concurrency:
+  group: helio-delivery-demo-api
+  cancel-in-progress: false
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: helio/demo-api-sandbox-us-east-1
+  SERVICE: demo-api-sandbox-us-east-1
+jobs:
+  build:
+    name: Build
+    runs-on:
+      - self-hosted
+      - apex-live
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Build and run tests
+        run: mvn -B -q verify
+      - name: AWS credentials by OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
+        with:
+          role-to-assume: ${{ vars.AWS_PUSH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64
+      - name: Build and push by digest
+        id: push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          image="$REGISTRY/$ECR_REPOSITORY"
+          # Fargate runs x86-64 tasks; build for it whatever the runner's own CPU.
+          docker build --platform linux/amd64 -t "$image:$GITHUB_SHA" .
+          docker push "$image:$GITHUB_SHA" > /dev/null
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$image:$GITHUB_SHA" | sed 's/.*@//')
+          case "$digest" in sha256:*) ;; *) echo '::error::Could not resolve the pushed image digest'; exit 1 ;; esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pushed $ECR_REPOSITORY@$digest"
+  scan:
+    name: Scan
+    needs:
+      - build
+    runs-on:
+      - self-hosted
+      - apex-live
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: AWS credentials by OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
+        with:
+          role-to-assume: ${{ vars.AWS_PUSH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64
+      - name: Scan the pushed image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          trivy image --quiet --ignore-unfixed --format json --output trivy.json "$REGISTRY/$ECR_REPOSITORY@$IMAGE_DIGEST"
+          jq -n --arg d "$IMAGE_DIGEST" --slurpfile t trivy.json '
+            ([$t[0].Results[]?.Vulnerabilities[]?.Severity] ) as $s
+            | {schema: "helio.scan-summary/1", image_digest: $d, scanner: "trivy",
+               counts: {critical: ($s | map(select(. == "CRITICAL")) | length),
+                        high: ($s | map(select(. == "HIGH")) | length),
+                        medium: ($s | map(select(. == "MEDIUM")) | length),
+                        low: ($s | map(select(. == "LOW")) | length)}}' > helio-scan-summary.json
+          cat helio-scan-summary.json
+          if [ "$(jq .counts.critical helio-scan-summary.json)" != "0" ]; then echo '::error::Critical vulnerabilities with a fix available'; exit 1; fi
+      - name: Keep the scan summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: helio-scan-summary
+          path: helio-scan-summary.json
+          if-no-files-found: error
+  deploy:
+    name: Deploy
+    needs:
+      - build
+      - scan
+    runs-on:
+      - self-hosted
+      - apex-live
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      delivery: ${{ steps.deliver.outputs.delivery }}
+    steps:
+      - name: Request delivery through Helio and wait
+        id: deliver
+        env:
+          HELIO_URL: ${{ vars.HELIO_URL }}
+          BINDING_ID: ${{ vars.HELIO_BINDING_ID }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HELIO_URL:-}" ] || [ -z "${BINDING_ID:-}" ]; then echo '::error::Set the HELIO_URL and HELIO_BINDING_ID repository variables'; exit 1; fi
+          # A fresh identity token for each call: they expire within minutes.
+          oidc() { curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=helio-delivery" | jq -r .value; }
+          request=$(jq -cn --arg b "$BINDING_ID" --arg d "$IMAGE_DIGEST" '{binding_id:$b, image_digest:$d}')
+          job=$(curl -fsS -X POST "$HELIO_URL/api/v1/delivery/requests" -H "X-Helio-Delivery-Token: $(oidc)" -H 'Content-Type: application/json' -H "Idempotency-Key: $GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" -d "$request")
+          id=$(echo "$job" | jq -r .id)
+          echo "delivery=$id" >> "$GITHUB_OUTPUT"
+          echo "Helio delivery $id requested for $IMAGE_DIGEST"
+          for _ in $(seq 1 80); do
+            status=$(curl -fsS "$HELIO_URL/api/v1/delivery/requests/$id" -H "X-Helio-Delivery-Token: $(oidc)" | jq -r .status)
+            echo "status: $status"
+            case "$status" in
+              deployed)
+                jq -n --arg c "$GITHUB_SHA" --arg i "$ECR_REPOSITORY" --arg d "$IMAGE_DIGEST" --arg s "$SERVICE" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                  '{schema:"helio.deploy-summary/1", commit:$c, environment:"production", image:$i, image_digest:$d, service:$s, deployed_at:$t}' > helio-deploy-summary.json
+                exit 0 ;;
+              failed|rolled_back|cancelled) echo "::error::Helio delivery ended as $status"; exit 1 ;;
+            esac
+            sleep 15
+          done
+          echo '::error::Timed out waiting for Helio delivery'; exit 1
+      - name: Keep the deploy summary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: helio-deploy-summary
+          path: helio-deploy-summary.json
+          if-no-files-found: error
+  verify-endpoint:
+    name: Verify endpoint
+    needs:
+      - deploy
+    runs-on:
+      - self-hosted
+      - apex-live
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Call the service
+        env:
+          ENDPOINT_URL: ${{ vars.ENDPOINT_URL }}
+          HELIO_URL: ${{ vars.HELIO_URL }}
+          DELIVERY: ${{ needs.deploy.outputs.delivery }}
+        run: |
+          set -euo pipefail
+          healthy=false; code=0; attempts=0
+          if [ -n "${ENDPOINT_URL:-}" ]; then
+            target="$ENDPOINT_URL"
+            for _ in $(seq 1 20); do
+              attempts=$((attempts + 1))
+              code=$(curl -s -o response.json -m 10 -w '%{http_code}' "$ENDPOINT_URL/" || true)
+              case "$code" in [1-5][0-9][0-9]) ;; *) code=0 ;; esac
+              if [ "$code" = "200" ] && [ "$(jq -r .service response.json 2>/dev/null)" = "demo-api" ]; then healthy=true; cat response.json; echo; break; fi
+              sleep 6
+            done
+          else
+            # No public address: ask Helio, which reads the service from inside the account.
+            target="in-account health check"
+            oidc() { curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=helio-delivery" | jq -r .value; }
+            for _ in $(seq 1 10); do
+              attempts=$((attempts + 1))
+              view=$(curl -fsS "$HELIO_URL/api/v1/delivery/requests/$DELIVERY" -H "X-Helio-Delivery-Token: $(oidc)")
+              if [ "$(echo "$view" | jq -r .status)" = "deployed" ] && [ "$(echo "$view" | jq -r '.result.running // 0')" -ge 1 ]; then healthy=true; code=200; break; fi
+              sleep 6
+            done
+          fi
+          jq -n --arg c "$GITHUB_SHA" --arg t "$target" --argjson s "$code" --argjson h "$healthy" --argjson a "$attempts" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{schema:"helio.endpoint-check/1", commit:$c, target:$t, http_status:$s, healthy:$h, checked_at:$at, attempts:$a}' > helio-endpoint-check.json
+          cat helio-endpoint-check.json
+          [ "$healthy" = "true" ] || { echo '::error::The service did not answer as healthy'; exit 1; }
+      - name: Keep the endpoint check
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: helio-endpoint-check
+          path: helio-endpoint-check.json
+          if-no-files-found: error
