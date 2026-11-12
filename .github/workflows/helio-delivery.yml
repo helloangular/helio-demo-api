@@ -1,0 +1,157 @@
+name: "Helio delivery: demo-api"
+"on":
+  push:
+    branches:
+      - "main"
+  pull_request:
+    branches:
+      - "main"
+  workflow_dispatch: {}
+permissions:
+  contents: "read"
+concurrency:
+  group: "helio-delivery-${{ github.ref }}"
+  cancel-in-progress: false
+env:
+  AWS_REGION: "us-east-1"
+  ECR_REPOSITORY: "helio/demo-api-sandbox-us-east-1"
+jobs:
+  test:
+    name: "Build and test"
+    runs-on:
+      - "self-hosted"
+      - "apex-live"
+    steps:
+      - name: "Check out"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+      - name: "Set up Java"
+        uses: "actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961"
+        with:
+          distribution: "temurin"
+          java-version: "21"
+          cache: "maven"
+      - name: "Build and run tests"
+        run: "mvn -B verify"
+  secret-scan:
+    name: "Secret scan"
+    runs-on:
+      - "self-hosted"
+      - "apex-live"
+    steps:
+      - name: "Check out full history"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        with:
+          fetch-depth: 0
+      - name: "Gitleaks v8.30.1"
+        run: |
+          set -euo pipefail
+          # Every commit on the branch, so a secret removed later is still found.
+          docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f git --redact --no-banner .
+  sast:
+    name: "Static analysis"
+    runs-on:
+      - "self-hosted"
+      - "apex-live"
+    steps:
+      - name: "Check out"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+      - name: "Semgrep 1.181.1"
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep@sha256:3db5c7af55eb1f512eac0abf0ab69a97b52c74b5e9a27314c221aee1a78d7ab2 semgrep scan --config p/owasp-top-ten --error --metrics off
+  image:
+    name: "Build, push and scan image"
+    runs-on:
+      - "self-hosted"
+      - "apex-live"
+    needs:
+      - "test"
+      - "secret-scan"
+      - "sast"
+    if: "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    permissions:
+      contents: "read"
+      id-token: "write"
+    outputs:
+      digest: "${{ steps.push.outputs.digest }}"
+      ref: "${{ steps.push.outputs.ref }}"
+    steps:
+      - name: "Check out"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+      - name: "AWS credentials by OIDC"
+        uses: "aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c"
+        with:
+          role-to-assume: "arn:aws:iam::465083445816:role/github-ecr-push-helio-demo-api"
+          aws-region: "${{ env.AWS_REGION }}"
+      - name: "Log in to Amazon ECR"
+        id: "ecr"
+        uses: "aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64"
+      - name: "Build and push by digest"
+        id: "push"
+        env:
+          REGISTRY: "${{ steps.ecr.outputs.registry }}"
+        run: |
+          set -euo pipefail
+          image="$REGISTRY/$ECR_REPOSITORY"
+          # Fargate runs x86-64 tasks; build for it whatever the runner's own CPU.
+          docker build --platform linux/amd64 -t "$image:$GITHUB_SHA" .
+          docker push "$image:$GITHUB_SHA"
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$image:$GITHUB_SHA" | sed 's/.*@//')
+          case "$digest" in sha256:*) ;; *) echo '::error::Could not resolve the pushed image digest'; exit 1 ;; esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "ref=$image@$digest" >> "$GITHUB_OUTPUT"
+      - name: "Scan the pushed image"
+        uses: "aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25"
+        with:
+          image-ref: "${{ steps.push.outputs.ref }}"
+          severity: "CRITICAL"
+          exit-code: "1"
+          ignore-unfixed: true
+          cache-dir: "${{ runner.tool_cache }}/trivy-db-cache"
+      - name: "Generate SBOM"
+        uses: "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610"
+        with:
+          image: "${{ steps.push.outputs.ref }}"
+          format: "cyclonedx-json"
+          output-file: "sbom.cdx.json"
+      - name: "Keep the SBOM"
+        uses: "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+        with:
+          name: "sbom"
+          path: "sbom.cdx.json"
+  deliver:
+    name: "Deliver through Helio"
+    runs-on:
+      - "self-hosted"
+      - "apex-live"
+    needs:
+      - "image"
+    if: "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    permissions:
+      contents: "read"
+      id-token: "write"
+    steps:
+      - name: "Request delivery and wait"
+        env:
+          HELIO_URL: "${{ vars.HELIO_URL }}"
+          BINDING_ID: "dlvb_f497139a-c0f2-4e3e-86c8-1406f2220eb2"
+          IMAGE_DIGEST: "${{ needs.image.outputs.digest }}"
+        run: |
+          set -euo pipefail
+          if [ -z "${HELIO_URL:-}" ]; then echo '::error::Set the HELIO_URL repository variable to your Helio address'; exit 1; fi
+          # A fresh OIDC token for each call: they expire within minutes.
+          oidc() { curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=helio-delivery" | jq -r .value; }
+          request=$(jq -cn --arg b "$BINDING_ID" --arg d "$IMAGE_DIGEST" '{binding_id:$b, image_digest:$d}')
+          job=$(curl -fsS -X POST "$HELIO_URL/api/v1/delivery/requests" -H "X-Helio-Delivery-Token: $(oidc)" -H 'Content-Type: application/json' -H "Idempotency-Key: $GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" -d "$request")
+          id=$(echo "$job" | jq -r .id)
+          echo "Helio delivery $id requested for $IMAGE_DIGEST"
+          for _ in $(seq 1 80); do
+            status=$(curl -fsS "$HELIO_URL/api/v1/delivery/requests/$id" -H "X-Helio-Delivery-Token: $(oidc)" | jq -r .status)
+            echo "status: $status"
+            case "$status" in
+              deployed) exit 0 ;;
+              failed|rolled_back|cancelled) echo "::error::Helio delivery ended as $status"; exit 1 ;;
+            esac
+            sleep 15
+          done
+          echo '::error::Timed out waiting for Helio delivery'; exit 1
