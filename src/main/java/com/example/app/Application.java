@@ -14,7 +14,7 @@ import java.util.Map;
 public class Application {
     @GetMapping("/")
     public Map<String, Object> root() {
-        return Map.of("service", "demo-api", "message", "Hello from Helio Pulse, delivered by a governed release", "runtime", "java/spring-boot", "ok", true);
+        return Map.of("service", "demo-api", "message", "Hello from Helio Pulse, Thursday rehearsal", "runtime", "java/spring-boot", "ok", true);
     }
 
     public static void main(String[] args) {
